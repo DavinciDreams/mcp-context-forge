@@ -1,0 +1,9 @@
+**
+!mcpgateway/
+!mcpgateway/admin.py
+!mcpgateway/main.py
+!mcpgateway/services/
+!mcpgateway/services/a2a_service.py
+!tests/
+!tests/**
+!pyproject.toml

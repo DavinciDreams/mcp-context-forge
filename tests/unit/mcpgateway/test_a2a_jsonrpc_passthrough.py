@@ -339,6 +339,31 @@ class TestJSONRPCPassthroughSecurity:
 class TestJSONRPCPassthroughResponseFormat:
     """Test response format handling."""
 
+    @pytest.mark.parametrize("method", ["message/stream", "SendStreamingMessage", "tasks/resubscribe", "SubscribeToTask"])
+    def test_streaming_methods_return_sse(self, mock_a2a_service, mock_auth, auth_headers, method):
+        """Streaming methods preserve SSE framing and bypass JSON serialization."""
+        async def events():
+            yield b': heartbeat\n\ndata: {"jsonrpc":"2.0","result":{"state":"working"},"id":1}\n\n'
+            yield b'data: {"jsonrpc":"2.0","result":{"state":"completed"},"id":1}\n\n'
+
+        mock_a2a_service.stream_agent = AsyncMock(return_value=events())
+        response = TestClient(app).post("/a2a/test-agent/jsonrpc", json={"jsonrpc": "2.0", "method": method, "params": {}, "id": 1}, headers=auth_headers)
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        assert response.headers["x-accel-buffering"] == "no"
+        assert response.text.startswith(": heartbeat\n\n")
+        assert '"completed"' in response.text
+        mock_a2a_service.invoke_agent.assert_not_called()
+        assert mock_a2a_service.stream_agent.call_args.kwargs["user_email"] == "test-user@example.com"
+
+    def test_streaming_method_can_return_json_error(self, mock_a2a_service, mock_auth, auth_headers):
+        """Upstream JSON errors retain their JSON-RPC envelope."""
+        error = {"jsonrpc": "2.0", "id": 42, "error": {"code": -32601, "message": "Not supported"}}
+        mock_a2a_service.stream_agent = AsyncMock(return_value=error)
+        response = TestClient(app).post("/a2a/test-agent/jsonrpc", json={"jsonrpc": "2.0", "method": "message/stream", "params": {}, "id": 42}, headers=auth_headers)
+        assert response.status_code == 200
+        assert response.json() == error
+
     def test_wraps_non_jsonrpc_response(self, mock_a2a_service, mock_auth, auth_headers):
         """Test that non-JSON-RPC responses are wrapped in JSON-RPC format."""
         # Mock agent that returns plain dict (not JSON-RPC formatted)

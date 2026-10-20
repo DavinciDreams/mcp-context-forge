@@ -12,8 +12,10 @@ and interactions with A2A-compatible agents.
 """
 
 # Standard
+import asyncio
 import base64
 import binascii
+from contextlib import suppress
 from datetime import datetime, timezone
 import json
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
@@ -59,6 +61,7 @@ from mcpgateway.utils.trace_redaction import is_input_capture_enabled, is_output
 # Cache import (lazy to avoid circular dependencies)
 _REGISTRY_CACHE = None
 _TOOL_LOOKUP_CACHE = None
+_A2AStreamItem = Union[bytes, Dict[str, Any], Exception]
 
 
 def _get_registry_cache():
@@ -2004,6 +2007,103 @@ class A2AAgentService(BaseService):
             return _filter_sensitive_headers(whitelisted)
         return whitelisted
 
+    async def stream_agent(self, db: Session, agent_name: str, parameters: Dict[str, Any], **context: Any) -> Union[Dict[str, Any], AsyncGenerator[bytes, None]]:
+        """Start an authorized invocation and forward SSE with bounded backpressure.
+
+        Args:
+            db: Database session.
+            agent_name: Registered agent name.
+            parameters: JSON-RPC request.
+            **context: Authenticated invocation context.
+
+        Returns:
+            An SSE iterator, or the upstream JSON response.
+
+        Raises:
+            A2AAgentError: If invocation fails before streaming starts.
+            A2AAgentNotFoundError: If the caller cannot access the agent.
+        """
+        queue: asyncio.Queue[_A2AStreamItem] = asyncio.Queue(maxsize=1)
+
+        async def invoke() -> None:
+            """Keep governance and metrics active throughout the upstream stream."""
+            try:
+                result = await self.invoke_agent(db, agent_name, parameters, _stream_queue=queue, **context)
+            except Exception as exc:
+                await queue.put(exc)
+            else:
+                await queue.put(result)
+
+        task = asyncio.create_task(invoke())
+        try:
+            first = await queue.get()
+            if isinstance(first, Exception):
+                raise first
+            if isinstance(first, dict):
+                await task
+                return first
+        except BaseException:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+            raise
+
+        async def events() -> AsyncGenerator[bytes, None]:
+            """Forward frames and close upstream resources on consumer cancellation."""
+            try:
+                yield b""
+                while True:
+                    item = await queue.get()
+                    if isinstance(item, dict):
+                        return
+                    if isinstance(item, Exception):
+                        error = {"jsonrpc": "2.0", "id": parameters.get("id"), "error": {"code": -32603, "message": "A2A upstream stream failed"}}
+                        yield f"data: {json.dumps(error)}\n\n".encode()
+                        return
+                    yield item
+            finally:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+        iterator = events()
+        await anext(iterator)
+        return iterator
+
+    async def _forward_sse_response(self, http_response: httpx.Response, queue: asyncio.Queue[_A2AStreamItem]) -> Dict[str, Any]:
+        """Forward SSE lines and retain the final JSON event for task persistence.
+
+        Args:
+            http_response: Open upstream streaming response.
+            queue: Bounded downstream queue.
+
+        Returns:
+            Final JSON event, when present.
+        """
+        await queue.put(b"")
+        data: List[str] = []
+        data_size = 0
+        response: Dict[str, Any] = {}
+        async for line in http_response.aiter_lines():
+            if not line:
+                if data and data_size <= settings.max_resource_size:
+                    try:
+                        event = json.loads("\n".join(data))
+                    except ValueError:
+                        pass
+                    else:
+                        if isinstance(event, dict):
+                            response = event
+                data = []
+                data_size = 0
+            elif line.startswith("data:"):
+                value = line[5:].removeprefix(" ")
+                data_size += len(value)
+                if data_size <= settings.max_resource_size:
+                    data.append(value)
+            await queue.put((line + "\n").encode("utf-8"))
+        return response
+
     async def invoke_agent(
         self,
         db: Session,
@@ -2019,6 +2119,7 @@ class A2AAgentService(BaseService):
         bearer_token: Optional[str] = None,
         content_type: Optional[str] = None,
         request_headers: Optional[Dict[str, str]] = None,
+        _stream_queue: Optional[asyncio.Queue[_A2AStreamItem]] = None,
     ) -> Dict[str, Any]:
         """Invoke an A2A agent by name or ID (UUID/UAID).
 
@@ -2041,6 +2142,7 @@ class A2AAgentService(BaseService):
             bearer_token: Bearer token to forward for RBAC enforcement in cross-gateway calls.
             content_type: Content-Type of the inbound request (for plugin context).
             request_headers: Inbound request headers (for plugin context in PRE_INVOKE hook).
+            _stream_queue: Internal bounded queue for the SSE proxy.
 
         Returns:
             Agent response.
@@ -2473,11 +2575,25 @@ class A2AAgentService(BaseService):
                     raise A2AAgentError(error_message) from validation_error
 
                 # Make HTTP request to the agent endpoint using an isolated SSRF-sensitive client.
+                response_json: Any
                 async with get_isolated_http_client(follow_redirects=False) as client:
-                    http_response = await client.post(pinned.endpoint_url, json=prepared.request_data, headers=pinned.headers, extensions=pinned.extensions)
-                status_code = http_response.status_code
-                response_json = http_response.json() if status_code == 200 else None
-                response_text = http_response.text
+                    if _stream_queue is not None:
+                        async with client.stream(
+                            "POST", pinned.endpoint_url, json=prepared.request_data, headers=pinned.headers, extensions=pinned.extensions, timeout=settings.mcpgateway_a2a_default_timeout
+                        ) as http_response:
+                            status_code = http_response.status_code
+                            if status_code == 200 and http_response.headers.get("content-type", "").split(";", 1)[0].strip().lower() == "text/event-stream":
+                                response_json = await self._forward_sse_response(http_response, _stream_queue)
+                                response_text = ""
+                            else:
+                                await http_response.aread()
+                                response_json = http_response.json() if status_code == 200 else None
+                                response_text = http_response.text
+                    else:
+                        http_response = await client.post(pinned.endpoint_url, json=prepared.request_data, headers=pinned.headers, extensions=pinned.extensions)
+                        status_code = http_response.status_code
+                        response_json = http_response.json() if status_code == 200 else None
+                        response_text = http_response.text
 
                 call_duration_ms = (datetime.now(timezone.utc) - call_start_time).total_seconds() * 1000
 
@@ -2495,7 +2611,9 @@ class A2AAgentService(BaseService):
                         if isinstance(task_data, dict) and "result" in task_data:
                             task_data = task_data["result"]
                         if isinstance(task_data, dict):
-                            resp_task_id = task_data.get("id") or task_data.get("task_id")
+                            task_data = task_data.get("task") or task_data.get("statusUpdate") or task_data
+                        if isinstance(task_data, dict):
+                            resp_task_id = task_data.get("taskId") or task_data.get("id") or task_data.get("task_id")
                             resp_state = None
                             if isinstance(task_data.get("status"), dict):
                                 resp_state = task_data["status"].get("state")

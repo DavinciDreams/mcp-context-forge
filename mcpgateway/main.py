@@ -5477,7 +5477,7 @@ async def invoke_a2a_agent_jsonrpc(
     body: Dict[str, Any] = Body(...),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
-) -> Dict[str, Any]:
+) -> Union[Dict[str, Any], Response]:
     """
     Transparent A2A JSON-RPC proxy endpoint.
 
@@ -5638,13 +5638,18 @@ async def invoke_a2a_agent_jsonrpc(
         parameters = body
 
         # Invoke the agent using the existing service method
-        result = await a2a_service.invoke_agent(
-            db,
-            agent_name,
-            parameters,
-            interaction_type="query",  # Default for JSON-RPC requests
-            **context,  # Unpack: user_id, user_email, token_teams, hop_count, bearer_token, content_type, request_headers
-        )
+        if method in {"message/stream", "SendStreamingMessage", "tasks/resubscribe", "SubscribeToTask"}:
+            result = await a2a_service.stream_agent(db, agent_name, parameters, **context)
+            if not isinstance(result, dict):
+                return StreamingResponse(result, media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        else:
+            result = await a2a_service.invoke_agent(
+                db,
+                agent_name,
+                parameters,
+                interaction_type="query",  # Default for JSON-RPC requests
+                **context,  # Unpack: user_id, user_email, token_teams, hop_count, bearer_token, content_type, request_headers
+            )
 
         # Return raw JSON-RPC response format
         # The agent's response should already be in JSON-RPC format if it's A2A-compliant
@@ -10581,15 +10586,9 @@ async def _execute_rpc_tools_call(
     if not name:
         raise JSONRPCError(-32602, "Missing tool name in parameters", params)
 
-    # Layer-1 exception: run ownership is captured below from the raw context,
-    # before admin-bypass normalization is applied.
-    auth_user_email, auth_token_teams, auth_is_admin = get_rpc_filter_context(request, user)
+    auth_user_email, auth_token_teams = get_scoped_resource_access_context(request, user)
     run_owner_email = auth_user_email
     run_owner_team_ids = [] if auth_token_teams is None else list(auth_token_teams)
-    if auth_is_admin and auth_token_teams is None:
-        auth_user_email = None
-    elif auth_token_teams is None:
-        auth_token_teams = []
 
     oauth_user_email = get_user_email(user)
     plugin_context_table = getattr(request.state, "plugin_context_table", None)

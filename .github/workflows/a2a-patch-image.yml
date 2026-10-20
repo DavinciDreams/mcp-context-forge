@@ -1,0 +1,42 @@
+name: A2A patch image
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fix/a2a-streaming-private-tests
+    paths:
+      - .github/workflows/a2a-patch-image.yml
+      - Dockerfile.a2a-patch*
+      - mcpgateway/admin.py
+      - mcpgateway/main.py
+      - mcpgateway/services/a2a_service.py
+      - tests/**
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  validate-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - name: Build validation image
+        run: docker build --target validation -f Dockerfile.a2a-patch -t contextforge-a2a-validation .
+      - name: Test the patched runtime
+        run: docker run --rm --network none contextforge-a2a-validation
+      - name: Verify authenticated streaming over real HTTP
+        run: docker run --rm --network none contextforge-a2a-validation tests/live_gateway/e2e/test_a2a_streaming_private_e2e.py -o addopts= --timeout=120 -q
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish immutable revision tag
+        env:
+          PATCH_REVISION: ${{ github.sha }}
+        run: |
+          image="ghcr.io/davincidreams/contextforge-a2a-patch:${PATCH_REVISION}"
+          docker build --target runtime -f Dockerfile.a2a-patch --build-arg PATCH_REVISION="${PATCH_REVISION}" -t "${image}" .
+          docker push "${image}"

@@ -6397,7 +6397,7 @@ class TestA2AAgentManagement:
     @patch.object(A2AAgentService, "get_agent")
     @patch.object(A2AAgentService, "invoke_agent")
     async def test_admin_test_a2a_agent_admin_bypass(self, mock_invoke_agent, mock_get_agent, mock_request, mock_db):
-        """Admin user with token_teams=None gets full bypass (user_email=None)."""
+        """Admin test retains owner identity with unrestricted visibility scope."""
         mock_agent = MagicMock()
         mock_agent.name = "Test Agent"
         mock_get_agent.return_value = mock_agent
@@ -6415,10 +6415,9 @@ class TestA2AAgentManagement:
         assert isinstance(result, JSONResponse)
         body = json.loads(result.body)
         assert body["success"] is True
-        # Admin bypass: get_agent called with user_email=None, token_teams=None
-        mock_get_agent.assert_called_with(mock_db, "agent-1", user_email=None, token_teams=None)
+        mock_get_agent.assert_called_with(mock_db, "agent-1", user_email="admin@example.com", token_teams=None)
         invoke_kwargs = mock_invoke_agent.call_args.kwargs
-        assert invoke_kwargs["user_email"] is None
+        assert invoke_kwargs["user_email"] == "admin@example.com"
         assert invoke_kwargs["token_teams"] is None
         # user_id still carries the real email for audit logging
         assert invoke_kwargs["user_id"] == "admin@example.com"
@@ -6433,6 +6432,7 @@ class TestA2AAgentManagement:
         mock_invoke_agent.return_value = {"result": "success"}
 
         mock_request.form = AsyncMock(return_value=FakeForm({"test_message": "Hello"}))
+        mock_request.state.token_teams = ["team-1"]
 
         result = await admin_test_a2a_agent(
             "agent-1",
