@@ -87,6 +87,7 @@ def live_pilot(tmp_path):
         "SSRF_ALLOW_PRIVATE_NETWORKS": "true",
         "PLUGINS_ENABLED": "false",
         "LOG_LEVEL": "ERROR",
+        "PYTHONUTF8": "1",
     }
     env.update({name: os.environ[name] for name in ("SYSTEMROOT", "WINDIR", "TEMP", "TMP") if name in os.environ})
     owner = make_test_jwt("admin@example.com", is_admin=True, teams=None, secret=signing_key, algorithm="HS256")
@@ -125,6 +126,8 @@ def live_pilot(tmp_path):
 def test_private_buttons_and_incremental_stream(live_pilot):
     """Verify both private test routes and incremental SSE without service mocks."""
     client, other, upstream_port = live_pilot
+    colleague = client.post("/auth/email/admin/users", json={"email": "other@example.com", "password": "S3!" + secrets.token_urlsafe(32), "is_admin": True})
+    assert colleague.status_code == 201, colleague.text
     created = client.post(
         "/a2a", json={"agent": {"name": "pilot", "endpoint_url": f"http://127.0.0.1:{upstream_port}/a2a", "agent_type": "generic", "protocol_version": "0.3"}, "visibility": "private"}
     )
@@ -145,7 +148,9 @@ def test_private_buttons_and_incremental_stream(live_pilot):
     assert tested.status_code == 200, tested.text
     assert "PRIVATE_PILOT_OK" in tested.text and "error" not in tested.json()
     denied = client.post(f"/admin/a2a/{agent['id']}/test", json={"query": "Hello"}, headers=make_auth_headers(other))
-    assert denied.status_code in (403, 404), denied.text
+    assert denied.status_code == 404, denied.text
+    denied_tool = client.post("/rpc", json=rpc, headers=make_auth_headers(other))
+    assert denied_tool.json()["error"]["code"] == -32601, denied_tool.text
     body = {"jsonrpc": "2.0", "method": "message/stream", "id": 1, "params": {"message": {"messageId": "m1", "role": "user", "parts": [{"kind": "text", "text": "Hello"}]}}}
     with client.stream("POST", "/a2a/pilot/jsonrpc", json=body) as response:
         assert response.status_code == 200
